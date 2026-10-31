@@ -2,160 +2,126 @@ import os
 import requests
 import datetime
 import io
-import zipfile
 import pandas as pd
 import numpy as np
 
 DATA_DIR = "data"
 PARQUET_PATH = os.path.join(DATA_DIR, "nse_rolling_60d.parquet")
-SECTOR_PATH = "nse_sector_master.csv"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    "Accept": "*/*",
-    "Accept-Language": "en-US,en;q=0.9",
-    "Referer": "https://www.nseindia.com/"
+    "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
 }
 
-def get_nse_session():
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    try:
-        session.get("https://www.nseindia.com", timeout=10)
-    except Exception as e:
-        print(f"Session handshake notice: {e}")
-    return session
-
-def fetch_real_bhavcopy(session, target_date: datetime.date):
+def fetch_sec_bhavdata(target_date: datetime.date):
     """
-    Downloads Bhavcopy and delivery reports with verified PREV_CLOSE.
-    Supports legacy archives, new UDiFF schemas, and public mirrors.
+    Downloads official NSE sec_bhavdata_full file containing both
+    OHLCV pricing, PREV_CLOSE, and delivery quantities in a single unzipped CSV.
     """
     date_str = target_date.strftime("%d%m%Y")
-    d_m_y = target_date.strftime("%d%b%Y").upper()
-    yyyymmdd = target_date.strftime("%Y%m%d")
-
-    candidate_urls = [
-        f"https://archives.nseindia.com/content/historical/EQUITIES/{target_date.year}/{target_date.strftime('%b').upper()}/cm{d_m_y}bhav.csv.zip",
-        f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip",
-        f"https://raw.githubusercontent.com/stock-market-india/nse-bhavcopy/main/data/{target_date.year}/{d_m_y}bhav.csv"
-    ]
-
-    df_bhav = None
-    for url in candidate_urls:
-        try:
-            r = session.get(url, timeout=12)
-            if r.status_code == 200 and len(r.content) > 1000:
-                if url.endswith(".zip"):
-                    with zipfile.ZipFile(io.BytesIO(r.content)) as z:
-                        csv_name = z.namelist()[0]
-                        with z.open(csv_name) as f:
-                            df_bhav = pd.read_csv(f)
-                else:
-                    df_bhav = pd.read_csv(io.StringIO(r.text))
-                print(f"Downloaded Bhavcopy from: {url}")
-                break
-        except Exception:
-            continue
-
-    if df_bhav is None or df_bhav.empty:
-        return None, False
-
-    df_bhav.columns = [str(c).strip().upper() for c in df_bhav.columns]
-
-    # Map column headers across legacy & UDiFF formats
-    sym_col = "TCKRSYMB" if "TCKRSYMB" in df_bhav.columns else ("SYMBOL" if "SYMBOL" in df_bhav.columns else df_bhav.columns[0])
-    srs_col = "SCTYSRS" if "SCTYSRS" in df_bhav.columns else ("SERIES" if "SERIES" in df_bhav.columns else None)
-    cls_col = "CLSPRC" if "CLSPRC" in df_bhav.columns else ("CLOSE" if "CLOSE" in df_bhav.columns else None)
-    prev_col = "PRVSCLSPRC" if "PRVSCLSPRC" in df_bhav.columns else ("PREVCLOSE" if "PREVCLOSE" in df_bhav.columns else None)
-    hgh_col = "HGSTPRC" if "HGSTPRC" in df_bhav.columns else ("HIGH" if "HIGH" in df_bhav.columns else None)
-    low_col = "LWSTPRC" if "LWSTPRC" in df_bhav.columns else ("LOW" if "LOW" in df_bhav.columns else None)
-    vol_col = "TTLTRDDFINMSTRMNTQTY" if "TTLTRDDFINMSTRMNTQTY" in df_bhav.columns else ("TOTTRDQTY" if "TOTTRDQTY" in df_bhav.columns else None)
-
-    if srs_col and srs_col in df_bhav.columns:
-        df_bhav = df_bhav[df_bhav[srs_col].astype(str).str.strip().str.upper() == "EQ"].copy()
-
-    df_bhav = df_bhav[[sym_col, cls_col, prev_col, hgh_col, low_col, vol_col]].copy()
-    df_bhav.columns = ["SYMBOL", "CLOSE", "PREV_CLOSE", "HIGH", "LOW", "TOTTRDQTY"]
-    df_bhav["SYMBOL"] = df_bhav["SYMBOL"].astype(str).str.strip().str.upper()
-
-    for num in ["CLOSE", "PREV_CLOSE", "HIGH", "LOW", "TOTTRDQTY"]:
-        df_bhav[num] = pd.to_numeric(df_bhav[num], errors="coerce").fillna(0.0)
-
-    # Official percentage change calculation using exchange PREV_CLOSE
-    df_bhav["PCT_CHANGE"] = np.where(
-        df_bhav["PREV_CLOSE"] > 0,
-        ((df_bhav["CLOSE"] - df_bhav["PREV_CLOSE"]) / df_bhav["PREV_CLOSE"] * 100).round(2),
-        0.0
-    )
-
-    # Fetch Security-wise Delivery Report (MTO)
-    mto_url = f"https://nsearchives.nseindia.com/archives/equities/mto/MTO_{date_str}.DAT"
+    url = f"https://nsearchives.nseindia.com/products/content/sec_bhavdata_full_{date_str}.csv"
+    
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    
     try:
-        r_mto = session.get(mto_url, timeout=10)
-        lines = [l.strip().split(",") for l in r_mto.text.strip().split("\n") if l.startswith("20")]
-        if lines:
-            df_mto = pd.DataFrame(lines)[[2, 3, 5]]
-            df_mto.columns = ["SYMBOL", "SERIES", "DELIV_QTY"]
-            df_mto["SYMBOL"] = df_mto["SYMBOL"].astype(str).str.strip().str.upper()
-            df_mto["SERIES"] = df_mto["SERIES"].astype(str).str.strip().str.upper()
-            df_mto = df_mto[df_mto["SERIES"] == "EQ"]
-            df_mto["DELIV_QTY"] = pd.to_numeric(df_mto["DELIV_QTY"], errors="coerce").fillna(0)
-            df_bhav = pd.merge(df_bhav, df_mto[["SYMBOL", "DELIV_QTY"]], on="SYMBOL", how="left")
-        else:
-            df_bhav["DELIV_QTY"] = (df_bhav["TOTTRDQTY"] * 0.52).astype(int)
-    except Exception:
-        df_bhav["DELIV_QTY"] = (df_bhav["TOTTRDQTY"] * 0.52).astype(int)
-
-    df_bhav["DELIV_QTY"] = df_bhav["DELIV_QTY"].fillna(df_bhav["TOTTRDQTY"] * 0.52)
-    df_bhav["DATE"] = pd.to_datetime(target_date)
-    return df_bhav, True
+        r = session.get(url, timeout=15)
+        if r.status_code != 200 or len(r.content) < 5000:
+            return None, False
+            
+        df = pd.read_csv(io.StringIO(r.text))
+        # Strip all leading/trailing whitespace from column names and values
+        df.columns = [str(c).strip().upper() for c in df.columns]
+        
+        # Verify required columns exist
+        if "SERIES" not in df.columns or "SYMBOL" not in df.columns:
+            return None, False
+            
+        df["SERIES"] = df["SERIES"].astype(str).str.strip().str.upper()
+        df["SYMBOL"] = df["SYMBOL"].astype(str).str.strip().str.upper()
+        
+        # Filter for standard equity market
+        df = df[df["SERIES"] == "EQ"].copy()
+        
+        # Map official columns
+        col_map = {
+            "CLOSE_PRICE": "CLOSE",
+            "PREV_CLOSE": "PREV_CLOSE",
+            "HIGH_PRICE": "HIGH",
+            "LOW_PRICE": "LOW",
+            "TTL_TRD_QNTY": "TOTTRDQTY",
+            "DELIV_QTY": "DELIV_QTY"
+        }
+        
+        for k in col_map.keys():
+            if k not in df.columns:
+                print(f"Missing column: {k}")
+                return None, False
+                
+        df = df[["SYMBOL"] + list(col_map.keys())].rename(columns=col_map)
+        
+        # Convert numeric fields cleanly
+        for num in ["CLOSE", "PREV_CLOSE", "HIGH", "LOW", "TOTTRDQTY", "DELIV_QTY"]:
+            df[num] = pd.to_numeric(df[num].astype(str).str.strip().str.replace("-", "0"), errors="coerce").fillna(0.0)
+            
+        # Official percentage change using verified PREV_CLOSE
+        df["PCT_CHANGE"] = np.where(
+            df["PREV_CLOSE"] > 0,
+            ((df["CLOSE"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"] * 100).round(2),
+            0.0
+        )
+        
+        df["DATE"] = pd.to_datetime(target_date)
+        return df, True
+        
+    except Exception as e:
+        print(f"Error reading session for {target_date}: {e}")
+        return None, False
 
 def update_rolling_history():
     os.makedirs(DATA_DIR, exist_ok=True)
-    session = get_nse_session()
-
     master_df = None
+    
     if os.path.exists(PARQUET_PATH):
         try:
             master_df = pd.read_parquet(PARQUET_PATH)
             master_df["DATE"] = pd.to_datetime(master_df["DATE"])
-            print(f"Loaded existing database with {len(master_df)} rows.")
+            print(f"Loaded existing parquet: {len(master_df)} rows.")
         except Exception as e:
-            print(f"Rebuilding parquet due to load notice: {e}")
+            print(f"Starting fresh parquet due to: {e}")
 
     today = datetime.date.today()
     found_data = None
-
-    # Step backward up to 10 days to handle market holidays and weekends
+    
+    # Adaptive Search: check backwards for latest trading session
     for lookback in range(0, 10):
         candidate = today - datetime.timedelta(days=lookback)
-        if candidate.weekday() >= 5:
+        if candidate.weekday() >= 5: # Skip weekends
             continue
-
-        print(f"Checking session availability: {candidate}...")
-        df_day, success = fetch_real_bhavcopy(session, candidate)
-        if success and df_day is not None and not df_day.empty:
-            print(f"Retrieved session {candidate} with {len(df_day)} stocks.")
-            found_data = df_day
+            
+        print(f"Fetching official NSE session: {candidate}...")
+        df_candidate, success = fetch_sec_bhavdata(candidate)
+        if success and df_candidate is not None and not df_candidate.empty:
+            print(f"Successfully loaded {len(df_candidate)} equities for {candidate}.")
+            found_data = df_candidate
             break
 
     if found_data is None:
-        raise RuntimeError("Unable to download Bhavcopy from available endpoints.")
+        raise RuntimeError("No active trading session file returned by NSE archives.")
 
     if master_df is not None:
-        # Avoid duplicate date records
+        # Remove candidate date if already present to prevent duplicate rows
         master_df = master_df[master_df["DATE"] != found_data["DATE"].iloc[0]]
         combined = pd.concat([master_df, found_data], ignore_index=True)
     else:
         combined = found_data
 
-    # Retain strictly the latest 60 sessions
+    # Retain the latest 60 unique active dates
     unique_dates = sorted(combined["DATE"].drop_duplicates(), reverse=True)[:60]
     final_df = combined[combined["DATE"].isin(unique_dates)].sort_values(["SYMBOL", "DATE"])
 
     final_df.to_parquet(PARQUET_PATH, index=False)
-    print(f"Saved {len(final_df)} records across {len(unique_dates)} dates into {PARQUET_PATH}.")
+    print(f"COMPLETE: Saved {len(final_df)} records across {len(unique_dates)} dates to {PARQUET_PATH}.")
 
 if __name__ == "__main__":
     update_rolling_history()
