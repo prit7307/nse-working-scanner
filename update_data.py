@@ -8,6 +8,7 @@ import numpy as np
 
 DATA_DIR = "data"
 PARQUET_PATH = os.path.join(DATA_DIR, "nse_rolling_60d.parquet")
+SECTOR_PATH = "nse_sector_master.csv"
 
 HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -16,19 +17,24 @@ HEADERS = {
     "Referer": "https://www.nseindia.com/"
 }
 
-def fetch_real_bhavcopy(target_date: datetime.date):
+def get_nse_session():
+    session = requests.Session()
+    session.headers.update(HEADERS)
+    try:
+        session.get("https://www.nseindia.com", timeout=10)
+    except Exception as e:
+        print(f"Session handshake notice: {e}")
+    return session
+
+def fetch_real_bhavcopy(session, target_date: datetime.date):
     """
-    Downloads authentic daily Bhavcopy with exact PREVCLOSE for all 2,000+ NSE equities.
-    Uses multiple fallback mirror protocols to ensure cloud runners never get blocked.
+    Downloads Bhavcopy and delivery reports with verified PREV_CLOSE.
+    Supports legacy archives, new UDiFF schemas, and public mirrors.
     """
     date_str = target_date.strftime("%d%m%Y")
     d_m_y = target_date.strftime("%d%b%Y").upper()
     yyyymmdd = target_date.strftime("%Y%m%d")
 
-    session = requests.Session()
-    session.headers.update(HEADERS)
-    
-    # Mirror endpoints for daily Bhavcopy
     candidate_urls = [
         f"https://archives.nseindia.com/content/historical/EQUITIES/{target_date.year}/{target_date.strftime('%b').upper()}/cm{d_m_y}bhav.csv.zip",
         f"https://nsearchives.nseindia.com/content/cm/BhavCopy_NSE_CM_0_0_0_{yyyymmdd}_F_0000.csv.zip",
@@ -47,7 +53,7 @@ def fetch_real_bhavcopy(target_date: datetime.date):
                             df_bhav = pd.read_csv(f)
                 else:
                     df_bhav = pd.read_csv(io.StringIO(r.text))
-                print(f"Successfully downloaded Bhavcopy from: {url}")
+                print(f"Downloaded Bhavcopy from: {url}")
                 break
         except Exception:
             continue
@@ -57,7 +63,7 @@ def fetch_real_bhavcopy(target_date: datetime.date):
 
     df_bhav.columns = [str(c).strip().upper() for c in df_bhav.columns]
 
-    # Map column headers across old format and new UDiFF format
+    # Map column headers across legacy & UDiFF formats
     sym_col = "TCKRSYMB" if "TCKRSYMB" in df_bhav.columns else ("SYMBOL" if "SYMBOL" in df_bhav.columns else df_bhav.columns[0])
     srs_col = "SCTYSRS" if "SCTYSRS" in df_bhav.columns else ("SERIES" if "SERIES" in df_bhav.columns else None)
     cls_col = "CLSPRC" if "CLSPRC" in df_bhav.columns else ("CLOSE" if "CLOSE" in df_bhav.columns else None)
@@ -76,14 +82,14 @@ def fetch_real_bhavcopy(target_date: datetime.date):
     for num in ["CLOSE", "PREV_CLOSE", "HIGH", "LOW", "TOTTRDQTY"]:
         df_bhav[num] = pd.to_numeric(df_bhav[num], errors="coerce").fillna(0.0)
 
-    # Calculate exact percentage change right here at source
+    # Official percentage change calculation using exchange PREV_CLOSE
     df_bhav["PCT_CHANGE"] = np.where(
         df_bhav["PREV_CLOSE"] > 0,
         ((df_bhav["CLOSE"] - df_bhav["PREV_CLOSE"]) / df_bhav["PREV_CLOSE"] * 100).round(2),
         0.0
     )
 
-    # Fetch delivery volume
+    # Fetch Security-wise Delivery Report (MTO)
     mto_url = f"https://nsearchives.nseindia.com/archives/equities/mto/MTO_{date_str}.DAT"
     try:
         r_mto = session.get(mto_url, timeout=10)
@@ -92,7 +98,8 @@ def fetch_real_bhavcopy(target_date: datetime.date):
             df_mto = pd.DataFrame(lines)[[2, 3, 5]]
             df_mto.columns = ["SYMBOL", "SERIES", "DELIV_QTY"]
             df_mto["SYMBOL"] = df_mto["SYMBOL"].astype(str).str.strip().str.upper()
-            df_mto = df_mto[df_mto["SERIES"].astype(str).str.strip().str.upper() == "EQ"]
+            df_mto["SERIES"] = df_mto["SERIES"].astype(str).str.strip().str.upper()
+            df_mto = df_mto[df_mto["SERIES"] == "EQ"]
             df_mto["DELIV_QTY"] = pd.to_numeric(df_mto["DELIV_QTY"], errors="coerce").fillna(0)
             df_bhav = pd.merge(df_bhav, df_mto[["SYMBOL", "DELIV_QTY"]], on="SYMBOL", how="left")
         else:
@@ -106,44 +113,49 @@ def fetch_real_bhavcopy(target_date: datetime.date):
 
 def update_rolling_history():
     os.makedirs(DATA_DIR, exist_ok=True)
+    session = get_nse_session()
+
     master_df = None
     if os.path.exists(PARQUET_PATH):
         try:
             master_df = pd.read_parquet(PARQUET_PATH)
             master_df["DATE"] = pd.to_datetime(master_df["DATE"])
-        except Exception:
-            pass
+            print(f"Loaded existing database with {len(master_df)} rows.")
+        except Exception as e:
+            print(f"Rebuilding parquet due to load notice: {e}")
 
     today = datetime.date.today()
     found_data = None
-    
-    # Adaptive Search: check backwards for latest available official Bhavcopy
+
+    # Step backward up to 10 days to handle market holidays and weekends
     for lookback in range(0, 10):
         candidate = today - datetime.timedelta(days=lookback)
-        if candidate.weekday() >= 5: # Skip weekends
+        if candidate.weekday() >= 5:
             continue
-            
-        print(f"Checking NSE trading session for {candidate}...")
-        df_day, success = fetch_real_bhavcopy(candidate)
+
+        print(f"Checking session availability: {candidate}...")
+        df_day, success = fetch_real_bhavcopy(session, candidate)
         if success and df_day is not None and not df_day.empty:
-            print(f"SUCCESS: Loaded {len(df_day)} stocks with verified PREVCLOSE for {candidate}")
+            print(f"Retrieved session {candidate} with {len(df_day)} stocks.")
             found_data = df_day
             break
 
     if found_data is None:
-        raise RuntimeError("Could not download real Bhavcopy data from NSE archives.")
+        raise RuntimeError("Unable to download Bhavcopy from available endpoints.")
 
     if master_df is not None:
+        # Avoid duplicate date records
+        master_df = master_df[master_df["DATE"] != found_data["DATE"].iloc[0]]
         combined = pd.concat([master_df, found_data], ignore_index=True)
     else:
         combined = found_data
 
-    # Retain strictly the most recent 60 trading days
+    # Retain strictly the latest 60 sessions
     unique_dates = sorted(combined["DATE"].drop_duplicates(), reverse=True)[:60]
     final_df = combined[combined["DATE"].isin(unique_dates)].sort_values(["SYMBOL", "DATE"])
 
     final_df.to_parquet(PARQUET_PATH, index=False)
-    print(f"COMPLETE: Updated {PARQUET_PATH} with {len(final_df)} records.")
+    print(f"Saved {len(final_df)} records across {len(unique_dates)} dates into {PARQUET_PATH}.")
 
 if __name__ == "__main__":
     update_rolling_history()
