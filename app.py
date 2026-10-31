@@ -18,52 +18,63 @@ SECTOR_PATH = "nse_sector_master.csv"
 @st.cache_data(ttl=60)
 def load_all_metrics():
     if not os.path.exists(PARQUET_PATH):
-        st.error(f"Database file '{PARQUET_PATH}' not found. Please run GitHub Actions once.")
+        st.error(f"Database file '{PARQUET_PATH}' not found.")
         st.stop()
 
     df = pd.read_parquet(PARQUET_PATH)
     df["DATE"] = pd.to_datetime(df["DATE"])
     df = df.sort_values(["SYMBOL", "DATE"])
 
+    # Ensure all numerical columns are valid floats
+    for col in ["CLOSE", "HIGH", "LOW", "TOTTRDQTY", "DELIV_QTY"]:
+        if col in df.columns:
+            df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
+
     # 1. Delivery Surge Index (DSI)
     df["50D_AVG_DELIV"] = df.groupby("SYMBOL")["DELIV_QTY"].transform(lambda s: s.rolling(50, min_periods=1).mean())
-    df["DSI"] = (df["DELIV_QTY"] / df["50D_AVG_DELIV"]).round(2).fillna(1.0)
+    df["50D_AVG_DELIV"] = df["50D_AVG_DELIV"].replace(0, np.nan)
+    df["DSI"] = (df["DELIV_QTY"] / df["50D_AVG_DELIV"]).fillna(1.0).round(2)
 
     # 2. NR7 Volatility Contraction
-    df["RANGE"] = df["HIGH"] - df["LOW"]
+    df["RANGE"] = (df["HIGH"] - df["LOW"]).round(2)
     df["MIN_7D_RANGE"] = df.groupby("SYMBOL")["RANGE"].transform(lambda s: s.rolling(7, min_periods=1).min())
     df["NR7"] = (df["RANGE"] <= df["MIN_7D_RANGE"]) & (df["RANGE"] > 0)
 
-    # 3. Verified Price Change
-    if "PCT_CHANGE" not in df.columns:
-        if "PREV_CLOSE" in df.columns:
-            df["PCT_CHANGE"] = np.where(
-                df["PREV_CLOSE"] > 0,
-                ((df["CLOSE"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"] * 100).round(2),
-                0.0
-            )
-        else:
-            df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
-            df["PCT_CHANGE"] = np.where(
-                df["PREV_CLOSE"] > 0,
-                ((df["CLOSE"] - df["PREV_CLOSE"]) / df["PREV_CLOSE"] * 100).round(2),
-                0.0
-            )
+    # 3. Robust Price Change Calculation
+    if "PREV_CLOSE" in df.columns:
+        df["PREV_CLOSE"] = pd.to_numeric(df["PREV_CLOSE"], errors="coerce")
+    else:
+        df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
 
+    # If PREV_CLOSE is missing/NaN, fall back to OPEN or CLOSE
+    if "OPEN" in df.columns:
+        df["PREV_CLOSE"] = df["PREV_CLOSE"].fillna(pd.to_numeric(df["OPEN"], errors="coerce"))
+    
+    # If still NaN, fallback to CLOSE
+    df["PREV_CLOSE"] = df["PREV_CLOSE"].fillna(df["CLOSE"])
+
+    # Compute PCT_CHANGE safely without any NaN or Division by Zero
+    valid_mask = (df["PREV_CLOSE"] > 0) & (df["CLOSE"] > 0)
+    df["PCT_CHANGE"] = 0.0
+    df.loc[valid_mask, "PCT_CHANGE"] = (
+        ((df.loc[valid_mask, "CLOSE"] - df.loc[valid_mask, "PREV_CLOSE"]) / df.loc[valid_mask, "PREV_CLOSE"]) * 100.0
+    ).round(2)
+
+    # Moving Averages
     df["EMA20"] = df.groupby("SYMBOL")["CLOSE"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
     df["EMA50"] = df.groupby("SYMBOL")["CLOSE"].transform(lambda s: s.ewm(span=50, adjust=False).mean())
 
     # 4. Mansfield Relative Strength vs Universe Median
-    benchmark_closes = df.groupby("DATE")["CLOSE"].transform("median")
-    df["RAW_RS"] = df["CLOSE"] / benchmark_closes
-    df["SMA50_RS"] = df.groupby("SYMBOL")["RAW_RS"].transform(lambda s: s.rolling(50, min_periods=1).mean())
-    df["MANSFIELD_RS"] = (((df["RAW_RS"] / df["SMA50_RS"]) - 1) * 100).round(2).fillna(0.0)
+    benchmark_closes = df.groupby("DATE")["CLOSE"].transform("median").replace(0, np.nan)
+    df["RAW_RS"] = (df["CLOSE"] / benchmark_closes).fillna(1.0)
+    df["SMA50_RS"] = df.groupby("SYMBOL")["RAW_RS"].transform(lambda s: s.rolling(50, min_periods=1).mean()).replace(0, np.nan)
+    df["MANSFIELD_RS"] = (((df["RAW_RS"] / df["SMA50_RS"]) - 1.0) * 100.0).fillna(0.0).round(2)
 
-    # Latest Session Slice
+    # Extract Latest Session
     latest_date = df["DATE"].max()
     latest_df = df[df["DATE"] == latest_date].copy()
 
-    # Sector Lookup
+    # Sector Classification
     if os.path.exists(SECTOR_PATH):
         sec_df = pd.read_csv(SECTOR_PATH)
         sec_df["SYMBOL"] = sec_df["SYMBOL"].astype(str).str.strip().str.upper()
@@ -87,8 +98,8 @@ def load_all_metrics():
         Above_20EMA=("CLOSE", lambda c: (c >= latest_df.loc[c.index, "EMA20"]).sum()),
         Above_50EMA=("CLOSE", lambda c: (c >= latest_df.loc[c.index, "EMA50"]).sum())
     ).reset_index()
-    sector_breadth["Pct_Above_20EMA"] = ((sector_breadth["Above_20EMA"] / sector_breadth["Total_Stocks"]) * 100).round(1)
-    sector_breadth["Pct_Above_50EMA"] = ((sector_breadth["Above_50EMA"] / sector_breadth["Total_Stocks"]) * 100).round(1)
+    sector_breadth["Pct_Above_20EMA"] = ((sector_breadth["Above_20EMA"] / sector_breadth["Total_Stocks"]) * 100.0).round(1)
+    sector_breadth["Pct_Above_50EMA"] = ((sector_breadth["Above_50EMA"] / sector_breadth["Total_Stocks"]) * 100.0).round(1)
 
     return latest_df, sector_breadth, latest_date
 
@@ -120,7 +131,7 @@ if nr7_filter:
 if search_query:
     filtered_df = filtered_df[filtered_df["SYMBOL"].str.contains(search_query, na=False)]
 
-# --- Main Dashboard ---
+# --- Top Header Metrics ---
 st.title("NSE Universe Scanner & Institutional Breadth Engine")
 st.markdown(f"Tracking **{len(filtered_df):,}** of **{len(df_latest):,}** verified listed equities.")
 
@@ -142,9 +153,8 @@ tabs = st.tabs([
 # Tab 1: DVS Scatter Matrix
 with tabs[0]:
     st.subheader("Price Action vs Volume Distribution Matrix")
-    # Take top 300 stocks sorted by deliverable turnover for visual clarity
-    plot_df = filtered_df.sort_values(by="DELIV_QTY", ascending=False).head(300)
-    
+    plot_df = filtered_df.sort_values(by="DELIV_QTY", ascending=False).head(300).copy()
+
     fig_dvs = px.scatter(
         plot_df,
         x="PCT_CHANGE",
@@ -162,18 +172,13 @@ with tabs[0]:
         },
         labels={"PCT_CHANGE": "Price Change (%)", "DSI": "Delivery Surge Index (x Avg)"}
     )
-    
-    # Auto-adjust Y axis range so points are always visible
-    y_min = max(0.0, float(plot_df["DSI"].min()) * 0.8) if not plot_df.empty else 0.0
-    y_max = max(2.5, float(plot_df["DSI"].max()) * 1.2) if not plot_df.empty else 3.0
-    fig_dvs.update_yaxes(range=[y_min, y_max])
-    
+
     fig_dvs.add_vline(x=0.0, line_dash="dash", line_color="gray")
     fig_dvs.update_traces(textposition="top center")
     fig_dvs.update_layout(height=580, template="plotly_white")
     st.plotly_chart(fig_dvs, use_container_width=True)
 
-# Tab 2: Mansfield RS Leaders
+# Tab 2: Gainers & Losers Bar Charts
 with tabs[1]:
     st.subheader("Top Outperforming vs Lagging Equities")
     col_lead, col_lag = st.columns(2)
@@ -222,7 +227,7 @@ with tabs[2]:
     fig_breadth.update_layout(height=520, template="plotly_white")
     st.plotly_chart(fig_breadth, use_container_width=True)
 
-# Tab 4: Full Actionable Watchlist
+# Tab 4: Full Watchlist Table
 with tabs[3]:
     st.subheader("Actionable Watchlist Data Table")
     display_cols = ["SYMBOL", "SECTOR", "CLOSE", "PREV_CLOSE", "PCT_CHANGE", "DELIV_QTY", "DSI", "NR7", "Accumulation_Alert"]
