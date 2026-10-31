@@ -6,7 +6,7 @@ import plotly.graph_objects as go
 import os
 
 st.set_page_config(
-    page_title="Institutional Market Scanner & Breadth Engine",
+    page_title="NSE Universe Scanner & Institutional Breadth Engine",
     page_icon="📈",
     layout="wide",
     initial_sidebar_state="expanded"
@@ -18,7 +18,7 @@ SECTOR_PATH = "nse_sector_master.csv"
 @st.cache_data(ttl=60)
 def load_all_metrics():
     if not os.path.exists(PARQUET_PATH):
-        st.error(f"Database file '{PARQUET_PATH}' not found. Please trigger the GitHub Action to generate it.")
+        st.error(f"Database file '{PARQUET_PATH}' not found. Please run the GitHub Actions workflow once to build the database.")
         st.stop()
 
     df = pd.read_parquet(PARQUET_PATH)
@@ -34,7 +34,7 @@ def load_all_metrics():
     df["MIN_7D_RANGE"] = df.groupby("SYMBOL")["RANGE"].transform(lambda s: s.rolling(7, min_periods=1).min())
     df["NR7"] = (df["RANGE"] <= df["MIN_7D_RANGE"]) & (df["RANGE"] > 0)
 
-    # 3. Exact Price Change (calculated directly from PREV_CLOSE)
+    # 3. Exact Price Change calculation
     if "PCT_CHANGE" not in df.columns:
         if "PREV_CLOSE" in df.columns:
             df["PCT_CHANGE"] = np.where(
@@ -80,7 +80,7 @@ def load_all_metrics():
         np.where((latest_df["DSI"] >= 2.0) & (latest_df["PCT_CHANGE"] > 0), "DELIVERY SURGE", "NEUTRAL")
     )
 
-    # Sector Breadth Matrix
+    # Sector Breadth Aggregation
     sector_breadth = latest_df.groupby("SECTOR").agg(
         Total_Stocks=("SYMBOL", "count"),
         Above_20EMA=("CLOSE", lambda c: (c > latest_df.loc[c.index, "EMA20"]).sum()),
@@ -123,7 +123,7 @@ if search_query:
 
 # --- Main Dashboard ---
 st.title("NSE Universe Scanner & Institutional Breadth Engine")
-st.markdown(f"Tracking **{len(filtered_df):,}** of **{len(df_latest):,}** equities.")
+st.markdown(f"Tracking **{len(filtered_df):,}** of **{len(df_latest):,}** listed equities.")
 
 c1, c2, c3, c4 = st.columns(4)
 c1.metric("Screened Universe", f"{len(filtered_df):,} Stocks")
@@ -214,7 +214,7 @@ with tabs[2]:
     fig_breadth.update_layout(height=520, template="plotly_white")
     st.plotly_chart(fig_breadth, use_container_width=True)
 
-# Tab 4: Watchlist Table
+# Tab 4: Full Watchlist Data Table
 with tabs[3]:
     st.subheader("Full Watchlist Data Table")
     display_cols = ["SYMBOL", "SECTOR", "CLOSE", "PREV_CLOSE", "PCT_CHANGE", "DELIV_QTY", "DSI", "NR7", "MANSFIELD_RS", "Accumulation_Alert"]
