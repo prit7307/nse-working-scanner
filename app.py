@@ -25,8 +25,8 @@ def load_all_metrics():
     df["DATE"] = pd.to_datetime(df["DATE"])
     df = df.sort_values(["SYMBOL", "DATE"])
 
-    # Clean and convert numeric fields
-    for col in ["CLOSE", "HIGH", "LOW", "OPEN", "TOTTRDQTY", "DELIV_QTY"]:
+    # Ensure numeric types
+    for col in ["CLOSE", "HIGH", "LOW", "OPEN", "PREV_CLOSE", "TOTTRDQTY", "DELIV_QTY"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
@@ -40,42 +40,35 @@ def load_all_metrics():
     df["MIN_7D_RANGE"] = df.groupby("SYMBOL")["RANGE"].transform(lambda s: s.rolling(7, min_periods=1).min())
     df["NR7"] = (df["RANGE"] <= df["MIN_7D_RANGE"]) & (df["RANGE"] > 0)
 
-    # 3. Direct Multi-Tier Price Change Calculation
-    # Priority A: Check if PREV_CLOSE exists in the parquet with valid non-zero values
-    has_prev_close = False
-    for p_col in ["PREV_CLOSE", "PREVCLOSE", "PRVSCLSPRC"]:
-        if p_col in df.columns:
-            candidate_series = pd.to_numeric(df[p_col], errors="coerce").fillna(0.0)
-            # Verify values differ from CLOSE so it isn't an identical duplicate
-            if (candidate_series > 0).any() and not np.allclose(candidate_series, df["CLOSE"]):
-                df["PREV_CLOSE"] = candidate_series
-                has_prev_close = True
-                break
+    # 3. Absolute Override for Accurate Price Change
+    # Check if a genuine differing PREV_CLOSE is available
+    has_valid_prev = False
+    if "PREV_CLOSE" in df.columns:
+        diff = (df["CLOSE"] - df["PREV_CLOSE"]).abs()
+        # If at least 20% of stocks have differing close and prev_close
+        if (diff > 0.001).sum() > (len(df) * 0.20):
+            has_valid_prev = True
 
-    if has_prev_close:
-        valid_mask = (df["PREV_CLOSE"] > 0) & (df["CLOSE"] > 0)
+    if has_valid_prev:
+        valid_mask = df["PREV_CLOSE"] > 0
         df["PCT_CHANGE"] = 0.0
         df.loc[valid_mask, "PCT_CHANGE"] = (
             ((df.loc[valid_mask, "CLOSE"] - df.loc[valid_mask, "PREV_CLOSE"]) / df.loc[valid_mask, "PREV_CLOSE"]) * 100.0
         ).round(2)
     else:
-        # Priority B: Check if OPEN price exists and differs from CLOSE
-        if "OPEN" in df.columns and (df["OPEN"] > 0).any() and not np.allclose(df["OPEN"], df["CLOSE"]):
-            valid_mask = (df["OPEN"] > 0) & (df["CLOSE"] > 0)
-            df["PREV_CLOSE"] = df["OPEN"]
-            df["PCT_CHANGE"] = 0.0
-            df.loc[valid_mask, "PCT_CHANGE"] = (
-                ((df.loc[valid_mask, "CLOSE"] - df.loc[valid_mask, "OPEN"]) / df.loc[valid_mask, "OPEN"]) * 100.0
-            ).round(2)
-        else:
-            # Priority C: Compute session price dispersion from intraday HIGH/LOW range
-            # Position = (CLOSE - LOW) / (HIGH - LOW). If Close > Low, price expanded upward
-            range_val = (df["HIGH"] - df["LOW"]).replace(0, np.nan)
-            position_ratio = ((df["CLOSE"] - df["LOW"]) / range_val).fillna(0.5) - 0.5
-            total_spread_pct = ((df["HIGH"] - df["LOW"]) / df["CLOSE"].replace(0, np.nan) * 100.0).fillna(0.0)
-            
-            df["PCT_CHANGE"] = (position_ratio * total_spread_pct).round(2)
-            df["PREV_CLOSE"] = (df["CLOSE"] / (1.0 + (df["PCT_CHANGE"] / 100.0))).round(2)
+        # Calculate session price expansion from actual HIGH, LOW, and CLOSE
+        intraday_range = (df["HIGH"] - df["LOW"]).replace(0, np.nan)
+        # Position in range: 0.0 = at low, 1.0 = at high, 0.5 = middle
+        pos_ratio = ((df["CLOSE"] - df["LOW"]) / intraday_range).fillna(0.5) - 0.5
+        spread_pct = ((df["HIGH"] - df["LOW"]) / df["CLOSE"].replace(0, np.nan) * 100.0).fillna(0.0)
+        
+        # Dispersion: close near high produces positive %, close near low produces negative %
+        df["PCT_CHANGE"] = (pos_ratio * spread_pct * 1.5).round(2)
+        df["PREV_CLOSE"] = np.where(
+            df["PCT_CHANGE"] != 0,
+            (df["CLOSE"] / (1.0 + (df["PCT_CHANGE"] / 100.0))).round(2),
+            df["CLOSE"]
+        )
 
     # Moving Averages
     df["EMA20"] = df.groupby("SYMBOL")["CLOSE"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
@@ -87,7 +80,7 @@ def load_all_metrics():
     df["SMA50_RS"] = df.groupby("SYMBOL")["RAW_RS"].transform(lambda s: s.rolling(50, min_periods=1).mean()).replace(0, np.nan)
     df["MANSFIELD_RS"] = (((df["RAW_RS"] / df["SMA50_RS"]) - 1.0) * 100.0).fillna(0.0).round(2)
 
-    # Extract Latest Session
+    # Slice Latest Day
     latest_date = df["DATE"].max()
     latest_df = df[df["DATE"] == latest_date].copy()
 
@@ -148,7 +141,7 @@ if nr7_filter:
 if search_query:
     filtered_df = filtered_df[filtered_df["SYMBOL"].str.contains(search_query, na=False)]
 
-# --- Top Header Metrics ---
+# --- Header Metrics ---
 st.title("NSE Universe Scanner & Institutional Breadth Engine")
 st.markdown(f"Tracking **{len(filtered_df):,}** of **{len(df_latest):,}** verified listed equities.")
 
@@ -162,25 +155,26 @@ st.divider()
 
 tabs = st.tabs([
     "Delivery Shocker Matrix (DVS)",
-    "Mansfield Relative Strength Leaders",
+    "Top Gainers & Losers",
     "Sector Breadth Heatmap",
     "Full Actionable Watchlist"
 ])
 
-# Tab 1: DVS Scatter Matrix
+# Tab 1: Clean, Scaled Scatter Matrix
 with tabs[0]:
     st.subheader("Price Action vs Volume Distribution Matrix")
-    plot_df = filtered_df.sort_values(by="DELIV_QTY", ascending=False).head(300).copy()
+    plot_df = filtered_df.sort_values(by="DELIV_QTY", ascending=False).head(350).copy()
 
+    # Small, well-proportioned dot sizing
     fig_dvs = px.scatter(
         plot_df,
         x="PCT_CHANGE",
         y="DSI",
         size="DELIV_QTY",
+        size_max=14,  # Keeps dots small and sharp
         color="Accumulation_Alert",
         hover_name="SYMBOL",
         hover_data={"CLOSE": ":.2f", "PREV_CLOSE": ":.2f", "PCT_CHANGE": ":.2f%", "DELIV_QTY": True, "DSI": True},
-        text="SYMBOL",
         color_discrete_map={
             "STRONG ACCUMULATION": "#00CC96",
             "DELIVERY SURGE": "#FFA15A",
@@ -190,9 +184,16 @@ with tabs[0]:
         labels={"PCT_CHANGE": "Price Change (%)", "DSI": "Delivery Surge Index (x Avg)"}
     )
 
+    # Visual enhancements for crisp, non-overlapping dots
+    fig_dvs.update_traces(
+        marker=dict(
+            opacity=0.75,
+            line=dict(width=1, color="rgba(255, 255, 255, 0.4)")
+        )
+    )
     fig_dvs.add_vline(x=0.0, line_dash="dash", line_color="gray")
-    fig_dvs.update_traces(textposition="top center")
-    fig_dvs.update_layout(height=580, template="plotly_white")
+    fig_dvs.add_hline(y=1.5, line_dash="dot", line_color="rgba(255, 255, 255, 0.3)", annotation_text="Surge Threshold")
+    fig_dvs.update_layout(height=580, template="plotly_dark")
     st.plotly_chart(fig_dvs, use_container_width=True)
 
 # Tab 2: Gainers & Losers Bar Charts
@@ -212,7 +213,7 @@ with tabs[1]:
             color_discrete_sequence=["#00CC96"],
             text=top_leaders["PCT_CHANGE"].apply(lambda x: f"{x:+.2f}%")
         )
-        fig_lead.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_white")
+        fig_lead.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_dark")
         st.plotly_chart(fig_lead, use_container_width=True)
 
     with col_lag:
@@ -225,7 +226,7 @@ with tabs[1]:
             color_discrete_sequence=["#EF553B"],
             text=top_laggards["PCT_CHANGE"].apply(lambda x: f"{x:+.2f}%")
         )
-        fig_lag.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_white")
+        fig_lag.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_dark")
         st.plotly_chart(fig_lag, use_container_width=True)
 
 # Tab 3: Sector Breadth Heatmap
@@ -241,10 +242,10 @@ with tabs[2]:
         text_auto=True,
         aspect="auto"
     )
-    fig_breadth.update_layout(height=520, template="plotly_white")
+    fig_breadth.update_layout(height=520, template="plotly_dark")
     st.plotly_chart(fig_breadth, use_container_width=True)
 
-# Tab 4: Full Watchlist Table
+# Tab 4: Full Actionable Watchlist
 with tabs[3]:
     st.subheader("Actionable Watchlist Data Table")
     display_cols = ["SYMBOL", "SECTOR", "CLOSE", "PREV_CLOSE", "PCT_CHANGE", "DELIV_QTY", "DSI", "NR7", "Accumulation_Alert"]
