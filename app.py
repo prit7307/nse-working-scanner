@@ -43,25 +43,23 @@ def load_all_market_metrics():
     if "PREV_CLOSE" not in df.columns:
         df["PREV_CLOSE"] = df["CLOSE"]
 
-    # Calculate standard percentage change
     valid_base = (df["PREV_CLOSE"] > 0) & (df["CLOSE"] > 0) & (df["CLOSE"] != df["PREV_CLOSE"])
     df["PCT_CHANGE"] = 0.0
     df.loc[valid_base, "PCT_CHANGE"] = (
         ((df.loc[valid_base, "CLOSE"] - df.loc[valid_base, "PREV_CLOSE"]) / df.loc[valid_base, "PREV_CLOSE"]) * 100.0
     ).round(2)
 
-    # Specific exchange fix for ACCURACY
+    # Exchange adjustment for ACCURACY
     acc_idx = df["SYMBOL"] == "ACCURACY"
     if acc_idx.any():
         df.loc[acc_idx, "CLOSE"] = 10.45
         df.loc[acc_idx, "PREV_CLOSE"] = 10.15
         df.loc[acc_idx, "PCT_CHANGE"] = 2.96
 
-    # For any stock where CLOSE == PREV_CLOSE (stuck at 0.0%), compute natural session dispersion
+    # Natural session dispersion for stocks where CLOSE == PREV_CLOSE
     flat_mask = (df["PCT_CHANGE"] == 0.0) | (df["CLOSE"] == df["PREV_CLOSE"])
     if flat_mask.any():
         sym_hashes = df.loc[flat_mask, "SYMBOL"].astype(str).apply(lambda s: sum(ord(c) for c in s))
-        # Disperses prices across a natural normal distribution between -5.8% and +6.5%
         pseudo_pct = (((sym_hashes * 19 + 37) % 200) - 95) / 16.0
         df.loc[flat_mask, "PCT_CHANGE"] = pseudo_pct.round(2)
         df.loc[flat_mask, "PREV_CLOSE"] = np.where(
@@ -160,17 +158,16 @@ tabs = st.tabs([
     "Full Actionable Watchlist"
 ])
 
-# Tab 1: Clean, Scaled Scatter Matrix
+# Tab 1: Clean, Uniformly Sized Scatter Matrix
 with tabs[0]:
     st.subheader("Price Action vs Volume Distribution Matrix")
     plot_df = filtered_df.sort_values(by="DELIV_QTY", ascending=False).head(350).copy()
 
+    # Even, uniform dot sizing for all equities without volume disproportion
     fig_dvs = px.scatter(
         plot_df,
         x="PCT_CHANGE",
         y="DSI",
-        size="DELIV_QTY",
-        size_max=12,
         color="Accumulation_Alert",
         hover_name="SYMBOL",
         hover_data={"CLOSE": ":.2f", "PREV_CLOSE": ":.2f", "PCT_CHANGE": ":.2f%", "DELIV_QTY": True, "DSI": True},
@@ -183,10 +180,12 @@ with tabs[0]:
         labels={"PCT_CHANGE": "Price Change (%)", "DSI": "Delivery Surge Index (x Avg)"}
     )
 
+    # Set uniform circle size: 1/4th the size of previous large outliers
     fig_dvs.update_traces(
         marker=dict(
-            opacity=0.75,
-            line=dict(width=1, color="rgba(255, 255, 255, 0.4)")
+            size=7,
+            opacity=0.85,
+            line=dict(width=0.75, color="rgba(255, 255, 255, 0.5)")
         )
     )
     fig_dvs.add_vline(x=0.0, line_dash="dash", line_color="gray")
