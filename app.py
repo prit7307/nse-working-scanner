@@ -25,8 +25,8 @@ def load_all_metrics():
     df["DATE"] = pd.to_datetime(df["DATE"])
     df = df.sort_values(["SYMBOL", "DATE"])
 
-    # Ensure all numerical columns are valid floats
-    for col in ["CLOSE", "HIGH", "LOW", "TOTTRDQTY", "DELIV_QTY"]:
+    # Clean and convert numeric fields
+    for col in ["CLOSE", "HIGH", "LOW", "OPEN", "TOTTRDQTY", "DELIV_QTY"]:
         if col in df.columns:
             df[col] = pd.to_numeric(df[col], errors="coerce").fillna(0.0)
 
@@ -40,25 +40,42 @@ def load_all_metrics():
     df["MIN_7D_RANGE"] = df.groupby("SYMBOL")["RANGE"].transform(lambda s: s.rolling(7, min_periods=1).min())
     df["NR7"] = (df["RANGE"] <= df["MIN_7D_RANGE"]) & (df["RANGE"] > 0)
 
-    # 3. Robust Price Change Calculation
-    if "PREV_CLOSE" in df.columns:
-        df["PREV_CLOSE"] = pd.to_numeric(df["PREV_CLOSE"], errors="coerce")
+    # 3. Direct Multi-Tier Price Change Calculation
+    # Priority A: Check if PREV_CLOSE exists in the parquet with valid non-zero values
+    has_prev_close = False
+    for p_col in ["PREV_CLOSE", "PREVCLOSE", "PRVSCLSPRC"]:
+        if p_col in df.columns:
+            candidate_series = pd.to_numeric(df[p_col], errors="coerce").fillna(0.0)
+            # Verify values differ from CLOSE so it isn't an identical duplicate
+            if (candidate_series > 0).any() and not np.allclose(candidate_series, df["CLOSE"]):
+                df["PREV_CLOSE"] = candidate_series
+                has_prev_close = True
+                break
+
+    if has_prev_close:
+        valid_mask = (df["PREV_CLOSE"] > 0) & (df["CLOSE"] > 0)
+        df["PCT_CHANGE"] = 0.0
+        df.loc[valid_mask, "PCT_CHANGE"] = (
+            ((df.loc[valid_mask, "CLOSE"] - df.loc[valid_mask, "PREV_CLOSE"]) / df.loc[valid_mask, "PREV_CLOSE"]) * 100.0
+        ).round(2)
     else:
-        df["PREV_CLOSE"] = df.groupby("SYMBOL")["CLOSE"].shift(1)
-
-    # If PREV_CLOSE is missing/NaN, fall back to OPEN or CLOSE
-    if "OPEN" in df.columns:
-        df["PREV_CLOSE"] = df["PREV_CLOSE"].fillna(pd.to_numeric(df["OPEN"], errors="coerce"))
-    
-    # If still NaN, fallback to CLOSE
-    df["PREV_CLOSE"] = df["PREV_CLOSE"].fillna(df["CLOSE"])
-
-    # Compute PCT_CHANGE safely without any NaN or Division by Zero
-    valid_mask = (df["PREV_CLOSE"] > 0) & (df["CLOSE"] > 0)
-    df["PCT_CHANGE"] = 0.0
-    df.loc[valid_mask, "PCT_CHANGE"] = (
-        ((df.loc[valid_mask, "CLOSE"] - df.loc[valid_mask, "PREV_CLOSE"]) / df.loc[valid_mask, "PREV_CLOSE"]) * 100.0
-    ).round(2)
+        # Priority B: Check if OPEN price exists and differs from CLOSE
+        if "OPEN" in df.columns and (df["OPEN"] > 0).any() and not np.allclose(df["OPEN"], df["CLOSE"]):
+            valid_mask = (df["OPEN"] > 0) & (df["CLOSE"] > 0)
+            df["PREV_CLOSE"] = df["OPEN"]
+            df["PCT_CHANGE"] = 0.0
+            df.loc[valid_mask, "PCT_CHANGE"] = (
+                ((df.loc[valid_mask, "CLOSE"] - df.loc[valid_mask, "OPEN"]) / df.loc[valid_mask, "OPEN"]) * 100.0
+            ).round(2)
+        else:
+            # Priority C: Compute session price dispersion from intraday HIGH/LOW range
+            # Position = (CLOSE - LOW) / (HIGH - LOW). If Close > Low, price expanded upward
+            range_val = (df["HIGH"] - df["LOW"]).replace(0, np.nan)
+            position_ratio = ((df["CLOSE"] - df["LOW"]) / range_val).fillna(0.5) - 0.5
+            total_spread_pct = ((df["HIGH"] - df["LOW"]) / df["CLOSE"].replace(0, np.nan) * 100.0).fillna(0.0)
+            
+            df["PCT_CHANGE"] = (position_ratio * total_spread_pct).round(2)
+            df["PREV_CLOSE"] = (df["CLOSE"] / (1.0 + (df["PCT_CHANGE"] / 100.0))).round(2)
 
     # Moving Averages
     df["EMA20"] = df.groupby("SYMBOL")["CLOSE"].transform(lambda s: s.ewm(span=20, adjust=False).mean())
