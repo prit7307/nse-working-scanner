@@ -153,7 +153,7 @@ st.divider()
 
 tabs = st.tabs([
     "Delivery Shocker Matrix (DVS)",
-    "Top Gainers & Losers",
+    "Mansfield RS Strength Leaders",
     "Sector Breadth Heatmap",
     "Full Actionable Watchlist"
 ])
@@ -163,7 +163,6 @@ with tabs[0]:
     st.subheader("Price Action vs Volume Distribution Matrix")
     plot_df = filtered_df.sort_values(by="DELIV_QTY", ascending=False).head(350).copy()
 
-    # Even, uniform dot sizing for all equities without volume disproportion
     fig_dvs = px.scatter(
         plot_df,
         x="PCT_CHANGE",
@@ -180,7 +179,6 @@ with tabs[0]:
         labels={"PCT_CHANGE": "Price Change (%)", "DSI": "Delivery Surge Index (x Avg)"}
     )
 
-    # Set uniform circle size: 1/4th the size of previous large outliers
     fig_dvs.update_traces(
         marker=dict(
             size=7,
@@ -193,35 +191,35 @@ with tabs[0]:
     fig_dvs.update_layout(height=580, template="plotly_dark")
     st.plotly_chart(fig_dvs, use_container_width=True)
 
-# Tab 2: Top Gainers & Losers
+# Tab 2: Mansfield RS Strength Leaders
 with tabs[1]:
-    st.subheader("Top Outperforming vs Lagging Equities")
+    st.subheader("Top Relative Strength Outperformers vs. Underperformers")
     col_lead, col_lag = st.columns(2)
-    top_leaders = filtered_df.sort_values(by="PCT_CHANGE", ascending=False).head(25)
-    top_laggards = filtered_df.sort_values(by="PCT_CHANGE", ascending=True).head(25)
+    top_leaders = filtered_df.sort_values(by="MANSFIELD_RS", ascending=False).head(25)
+    top_laggards = filtered_df.sort_values(by="MANSFIELD_RS", ascending=True).head(25)
 
     with col_lead:
-        st.markdown("**Top 25 Gainers (Green)**")
+        st.markdown("**Top 25 Outperforming Stocks (Green)**")
         fig_lead = px.bar(
             top_leaders,
-            x="PCT_CHANGE",
+            x="MANSFIELD_RS",
             y="SYMBOL",
             orientation="h",
             color_discrete_sequence=["#00CC96"],
-            text=top_leaders["PCT_CHANGE"].apply(lambda x: f"{x:+.2f}%")
+            text="MANSFIELD_RS"
         )
         fig_lead.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_dark")
         st.plotly_chart(fig_lead, use_container_width=True)
 
     with col_lag:
-        st.markdown("**Top 25 Losers (Red)**")
+        st.markdown("**Top 25 Lagging Stocks (Red)**")
         fig_lag = px.bar(
             top_laggards,
-            x="PCT_CHANGE",
+            x="MANSFIELD_RS",
             y="SYMBOL",
             orientation="h",
             color_discrete_sequence=["#EF553B"],
-            text=top_laggards["PCT_CHANGE"].apply(lambda x: f"{x:+.2f}%")
+            text="MANSFIELD_RS"
         )
         fig_lag.update_layout(yaxis=dict(autorange="reversed"), height=550, template="plotly_dark")
         st.plotly_chart(fig_lag, use_container_width=True)
@@ -245,7 +243,7 @@ with tabs[2]:
 # Tab 4: Full Actionable Watchlist
 with tabs[3]:
     st.subheader("Actionable Watchlist Data Table")
-    display_cols = ["SYMBOL", "SECTOR", "CLOSE", "PREV_CLOSE", "PCT_CHANGE", "DELIV_QTY", "DSI", "NR7", "Accumulation_Alert"]
+    display_cols = ["SYMBOL", "SECTOR", "CLOSE", "PREV_CLOSE", "PCT_CHANGE", "DELIV_QTY", "DSI", "NR7", "MANSFIELD_RS", "Accumulation_Alert"]
     available_cols = [c for c in display_cols if c in filtered_df.columns]
     st.dataframe(
         filtered_df[available_cols].sort_values(by="DELIV_QTY", ascending=False).style.format({
@@ -253,7 +251,8 @@ with tabs[3]:
             "PREV_CLOSE": "₹{:,.2f}",
             "PCT_CHANGE": "{:+.2f}%",
             "DELIV_QTY": "{:,}",
-            "DSI": "{:.2f}x"
+            "DSI": "{:.2f}x",
+            "MANSFIELD_RS": "{:+.2f}"
         }),
         use_container_width=True,
         height=620
